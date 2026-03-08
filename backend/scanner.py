@@ -40,92 +40,9 @@ def get_bulk_data(formatted_tickers):
         print(f"Error fetching bulk data: {e}")
         return pd.DataFrame()
 
-def calculate_strategy_for_series(df):
-    """
-    Apply strategy logic for a single stock dataframe.
-    Returns the latest status.
-    """
-    if df.empty or len(df) < 30: # Need enough data for indicators
-        return None
-        
-    df = df.copy()
-    
-    # Indicators
-    try:
-        # Handle cases where columns might be multi-level or not
-        close = df['Close']
-        if isinstance(close, pd.DataFrame):
-            close = close.iloc[:, 0]
-            
-        sma_short = ta.sma(close, length=5)
-        sma_long = ta.sma(close, length=20)
-        rsi = ta.rsi(close, length=14)
-        macd_df = ta.macd(close)
-        
-        # Check if indicators are valid (not all NaN)
-        if sma_short is None or macd_df is None:
-            return None
-            
-        macd_val = macd_df.iloc[:, 0] # MACD
-        macd_signal = macd_df.iloc[:, 2] # Signal
-        
-        # Latest values
-        latest_close = close.iloc[-1]
-        latest_sma_short = sma_short.iloc[-1]
-        latest_sma_long = sma_long.iloc[-1]
-        latest_rsi = rsi.iloc[-1]
-        latest_macd = macd_val.iloc[-1]
-        latest_signal = macd_signal.iloc[-1]
-        
-        # Strategy Logic
-        score = 0
-        reasons = []
-        
-        # MA
-        if latest_sma_short > latest_sma_long:
-            score += 1
-            reasons.append("MA Bull")
-        elif latest_sma_short < latest_sma_long:
-            score -= 1
-            reasons.append("MA Bear")
-            
-        # RSI
-        if latest_rsi < 30:
-            score += 1
-            reasons.append("RSI Oversold")
-        elif latest_rsi > 70:
-            score -= 1
-            reasons.append("RSI Overbought")
-            
-        # MACD
-        if latest_macd > latest_signal:
-            score += 1
-            reasons.append("MACD Bull")
-        elif latest_macd < latest_signal:
-            score -= 1
-            reasons.append("MACD Bear")
-            
-        final_signal = "HOLD"
-        if score >= 2:
-            final_signal = "BUY"
-        elif score <= -2:
-            final_signal = "SELL"
-            
-        return {
-            "price": round(float(latest_close), 2),
-            "signal": final_signal,
-            "reasons": ", ".join(reasons),
-            "rsi": round(float(latest_rsi), 2),
-            "ma_gap": round(float(latest_sma_short - latest_sma_long), 2)
-        }
-            
-    except Exception as e:
-        # print(f"Calc error: {e}")
-        return None
-
 def scan_market(min_price=0, max_price=10000, strategy_filter="ALL"):
     """
-    Scans the specific list of stocks.
+    Scans the specific list of stocks using vectorized fast operations.
     """
     tickers = get_all_tw_stocks()
     data = get_bulk_data(tickers)
@@ -133,60 +50,111 @@ def scan_market(min_price=0, max_price=10000, strategy_filter="ALL"):
     
     if data.empty:
         return []
-        
-    tasks = []
-    for ticker_formatted in tickers:
-        try:
-            if isinstance(data.columns, pd.MultiIndex):
-                if ticker_formatted not in data.columns.levels[0]:
-                    continue
-                df_ticker = data[ticker_formatted]
-            else:
-                df_ticker = data
-            
-            # Simple check if data exists
-            if df_ticker['Close'].dropna().empty:
-                continue
-                
-            tasks.append((ticker_formatted, df_ticker))
-        except Exception as e:
+
+    # Extract Close prices for all tickers simultaneously
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            # yfinance group_by='ticker' results in (Ticker, Price). So level=1 is 'Close'
+            closes = data.xs('Close', axis=1, level=1)
+        else:
+            closes = data[['Close']]
+    except Exception as e:
+        print(f"Error extracting Close: {e}")
+        return []
+
+    # Fast Vectorized Computation
+    closes = closes.ffill()
+    sma_short = closes.rolling(window=5, min_periods=1).mean()
+    sma_long = closes.rolling(window=20, min_periods=1).mean()
+
+    delta = closes.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ema_up = up.ewm(com=13, adjust=False, min_periods=1).mean()
+    ema_down = down.ewm(com=13, adjust=False, min_periods=1).mean()
+    rs = ema_up / ema_down
+    rsi = 100 - (100 / (1 + rs))
+
+    ema12 = closes.ewm(span=12, adjust=False, min_periods=1).mean()
+    ema26 = closes.ewm(span=26, adjust=False, min_periods=1).mean()
+    macd_val = ema12 - ema26
+    macd_signal = macd_val.ewm(span=9, adjust=False, min_periods=1).mean()
+
+    # Get latest values across all 1800 tickers
+    latest_close = closes.iloc[-1]
+    latest_sma_short = sma_short.iloc[-1]
+    latest_sma_long = sma_long.iloc[-1]
+    latest_rsi = rsi.iloc[-1]
+    latest_macd = macd_val.iloc[-1]
+    latest_signal = macd_signal.iloc[-1]
+
+    for ticker_formatted in latest_close.index:
+        price = latest_close[ticker_formatted]
+        if pd.isna(price) or price <= 0:
             continue
             
-    def process_ticker(args):
-        ticker_formatted, df_ticker = args
-        analysis = calculate_strategy_for_series(df_ticker)
+        price = float(price)
         
-        if analysis:
-            price = analysis['price']
-            signal = analysis['signal']
+        # 1. Price Filter 
+        if not (min_price <= price <= max_price):
+            continue
             
-            # Filters
-            if not (min_price <= price <= max_price):
-                return None
-                
-            if strategy_filter != "ALL" and strategy_filter != signal:
-                return None
-                
-            # Get stock name
-            ticker_base = ticker_formatted.split('.')[0]
-            stock_name = ""
-            if ticker_base in twstock.codes:
-                stock_name = twstock.codes[ticker_base].name
-
-            return {
-                "stock_code": ticker_base,
-                "stock_name": stock_name,
-                **analysis
-            }
-        return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        for result in executor.map(process_ticker, tasks):
-            if result:
-                results.append(result)
+        s_short = float(latest_sma_short[ticker_formatted])
+        s_long = float(latest_sma_long[ticker_formatted])
+        r = float(latest_rsi[ticker_formatted])
+        m_val = float(latest_macd[ticker_formatted])
+        m_sig = float(latest_signal[ticker_formatted])
+        
+        score = 0
+        reasons = []
+        
+        if s_short > s_long:
+            score += 1
+            reasons.append("MA Bull")
+        elif s_short < s_long:
+            score -= 1
+            reasons.append("MA Bear")
             
-    # Sort by signal strength (Buy -> Hold -> Sell) or just Code
-    # Let's sort by Code for now
+        if pd.notna(r):
+            if r < 30:
+                score += 1
+                reasons.append("RSI Oversold")
+            elif r > 70:
+                score -= 1
+                reasons.append("RSI Overbought")
+                
+        if pd.notna(m_val) and pd.notna(m_sig):
+            if m_val > m_sig:
+                score += 1
+                reasons.append("MACD Bull")
+            elif m_val < m_sig:
+                score -= 1
+                reasons.append("MACD Bear")
+                
+        final_signal = "HOLD"
+        if score >= 2:
+            final_signal = "BUY"
+        elif score <= -2:
+            final_signal = "SELL"
+            
+        if strategy_filter != "ALL" and strategy_filter != final_signal:
+            continue
+            
+        ticker_base = str(ticker_formatted).split('.')[0]
+        stock_name = ""
+        if ticker_base in twstock.codes:
+            stock_name = twstock.codes[ticker_base].name
+
+        results.append({
+            "stock_code": ticker_base,
+            "stock_name": stock_name,
+            "price": round(price, 2),
+            "signal": final_signal,
+            "reasons": ", ".join(reasons),
+            "rsi": round(r, 2) if pd.notna(r) else 0,
+            "ma_gap": round(s_short - s_long, 2) if pd.notna(s_short) and pd.notna(s_long) else 0
+        })
+
     return sorted(results, key=lambda x: x['stock_code'])
 
 def scan_volume_spikes(threshold: int = 400):
