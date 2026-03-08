@@ -2,9 +2,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from backend.analysis import analyze_stock
-from backend.backtest import run_backtest
-from backend.scanner import scan_market, scan_volume_spikes
+from analysis import analyze_stock
+from scanner import scan_market
+from backtest import run_backtest
+from scanner import scan_volume_spikes
 import os
 from datetime import datetime
 
