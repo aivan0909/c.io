@@ -3,22 +3,39 @@ import pandas as pd
 import pandas_ta as ta
 import twstock
 from datetime import datetime, timedelta
+import concurrent.futures
+import warnings
+warnings.filterwarnings('ignore')
 
-# Top 10 Taiwan Stocks (Simpler list for connection test)
-TOP_STOCKS = [
-    "2330", "2317", "2454", "2308", "2303", "2881", "2882", "2891", "2002", "1301"
-]
+# Remove hardcoded list
+# TOP_STOCKS = [...]
 
-def get_bulk_data(tickers):
-    # Formatted tickers
-    formatted_tickers = [f"{t}.TW" for t in tickers]
-    
+def get_all_tw_stocks():
+    """Returns a list of all 4-digit TWSE and TPEX stock codes formatted for yfinance."""
+    twse = [f"{c}.TW" for c, info in twstock.twse.items() if info.type == '股票' and len(c) == 4]
+    tpex = [f"{c}.TWO" for c, info in twstock.tpex.items() if info.type == '股票' and len(c) == 4]
+    return twse + tpex
+
+def get_bulk_data(formatted_tickers):
     # Get history
     start_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
     
     try:
-        data = yf.download(formatted_tickers, start=start_date, progress=False, group_by='ticker')
-        return data
+        # Download in smaller batches if list is very large
+        # Render free tier might choke on 1800+ tickers at once
+        batch_size = 300 # Reduced batch size for stability
+        all_data = []
+        
+        for i in range(0, len(formatted_tickers), batch_size):
+            batch = formatted_tickers[i:i+batch_size]
+            data = yf.download(batch, start=start_date, progress=False, group_by='ticker', threads=True)
+            if not data.empty:
+                all_data.append(data)
+                
+        if not all_data:
+            return pd.DataFrame()
+            
+        return pd.concat(all_data, axis=1)
     except Exception as e:
         print(f"Error fetching bulk data: {e}")
         return pd.DataFrame()
@@ -110,59 +127,63 @@ def scan_market(min_price=0, max_price=10000, strategy_filter="ALL"):
     """
     Scans the specific list of stocks.
     """
-    data = get_bulk_data(TOP_STOCKS)
+    tickers = get_all_tw_stocks()
+    data = get_bulk_data(tickers)
     results = []
     
     if data.empty:
         return []
         
-    # Iterate through tickers in the downloaded data
-    # yfinance group_by='ticker' makes the top level columns the tickers
-    available_tickers = data.columns.levels[0] if isinstance(data.columns, pd.MultiIndex) else TOP_STOCKS
-    
-    # If single ticker result (shouldn't happen with list but safety check)
-    if len(TOP_STOCKS) == 1:
-        # Logic for single
-        pass 
-        
-    for ticker_code in TOP_STOCKS:
+    tasks = []
+    for ticker_formatted in tickers:
         try:
-            ticker_formatted = f"{ticker_code}.TW"
-            if ticker_formatted not in data.columns.levels[0]:
-                continue
-                
-            df_ticker = data[ticker_formatted]
+            if isinstance(data.columns, pd.MultiIndex):
+                if ticker_formatted not in data.columns.levels[0]:
+                    continue
+                df_ticker = data[ticker_formatted]
+            else:
+                df_ticker = data
             
             # Simple check if data exists
             if df_ticker['Close'].dropna().empty:
                 continue
-
-            analysis = calculate_strategy_for_series(df_ticker)
-            
-            if analysis:
-                price = analysis['price']
-                signal = analysis['signal']
                 
-                # Filters
-                if not (min_price <= price <= max_price):
-                    continue
-                    
-                if strategy_filter != "ALL" and strategy_filter != signal:
-                    continue
-                    
-                # Get stock name
-                stock_name = ""
-                if ticker_code in twstock.codes:
-                    stock_name = twstock.codes[ticker_code].name
-
-                results.append({
-                    "stock_code": ticker_code,
-                    "stock_name": stock_name,
-                    **analysis
-                })
-                
+            tasks.append((ticker_formatted, df_ticker))
         except Exception as e:
             continue
+            
+    def process_ticker(args):
+        ticker_formatted, df_ticker = args
+        analysis = calculate_strategy_for_series(df_ticker)
+        
+        if analysis:
+            price = analysis['price']
+            signal = analysis['signal']
+            
+            # Filters
+            if not (min_price <= price <= max_price):
+                return None
+                
+            if strategy_filter != "ALL" and strategy_filter != signal:
+                return None
+                
+            # Get stock name
+            ticker_base = ticker_formatted.split('.')[0]
+            stock_name = ""
+            if ticker_base in twstock.codes:
+                stock_name = twstock.codes[ticker_base].name
+
+            return {
+                "stock_code": ticker_base,
+                "stock_name": stock_name,
+                **analysis
+            }
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for result in executor.map(process_ticker, tasks):
+            if result:
+                results.append(result)
             
     # Sort by signal strength (Buy -> Hold -> Sell) or just Code
     # Let's sort by Code for now
@@ -170,11 +191,24 @@ def scan_market(min_price=0, max_price=10000, strategy_filter="ALL"):
 
 def scan_volume_spikes(threshold: int = 400):
     """
-    Scans the TOP_STOCKS for 1-minute volume spikes exceeding the threshold.
+    Scans the market for 1-minute volume spikes exceeding the threshold.
     """
-    formatted_tickers = [f"{t}.TW" for t in TOP_STOCKS]
+    tickers = get_all_tw_stocks()
+    
     try:
-        data = yf.download(formatted_tickers, period="1d", interval="1m", progress=False, group_by='ticker')
+        # For 1m data, batching is critical
+        batch_size = 300
+        all_data = []
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i:i+batch_size]
+            data = yf.download(batch, period="1d", interval="1m", progress=False, group_by='ticker', threads=True)
+            if not data.empty:
+                all_data.append(data)
+                
+        if not all_data:
+            return []
+            
+        data = pd.concat(all_data, axis=1)
     except Exception as e:
         print(f"Error fetching 1m data: {e}")
         return []
@@ -194,9 +228,8 @@ def scan_volume_spikes(threshold: int = 400):
     except Exception as e:
         print(f"Timezone conversion error: {e}")
 
-    for ticker_code in TOP_STOCKS:
+    for ticker_formatted in tickers:
         try:
-            ticker_formatted = f"{ticker_code}.TW"
             if isinstance(data.columns, pd.MultiIndex):
                 if ticker_formatted not in data.columns.levels[0]:
                     continue
@@ -213,9 +246,10 @@ def scan_volume_spikes(threshold: int = 400):
                     continue
                     
                 if vol >= threshold:
+                    ticker_base = ticker_formatted.split('.')[0]
                     stock_name = ""
-                    if ticker_code in twstock.codes:
-                        stock_name = twstock.codes[ticker_code].name
+                    if ticker_base in twstock.codes:
+                        stock_name = twstock.codes[ticker_base].name
                         
                     # Estimate momentum (Taiwan convention: Red/Up=Buy, Green/Down=Sell)
                     try:
@@ -232,7 +266,7 @@ def scan_volume_spikes(threshold: int = 400):
                         
                     results.append({
                         "time": timestamp.strftime('%H:%M:%S'),
-                        "stock_code": ticker_code,
+                        "stock_code": ticker_base,
                         "stock_name": stock_name,
                         "price": round(float(row['Close']), 2) if not pd.isna(row['Close']) else 0,
                         "volume": int(vol),
